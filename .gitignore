@@ -1,0 +1,31 @@
+NTUSER*
+AppData/
+Contacts/
+Desktop/
+Documents/
+Downloads/
+Favorites/
+Links/
+Music/
+Saved Games/
+Searches/
+Videos/
+__pycache__/
+.claude/
+.claude.json
+.matplotlib/
+.env
+.node_repl_history
+Application Data/
+Cookies/
+Local Settings/
+My Documents/
+NetHood/
+PrintHood/
+Recent/
+SendTo/
+Start Menu/
+Templates/
+data/
+results/
+logs/

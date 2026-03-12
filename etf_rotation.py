@@ -46,8 +46,8 @@ ET              = pytz.timezone("America/New_York")
 ENV_FILE        = ".env"
 STATE_FILE      = ".etf_rotation_state.json"
 
-CAPITAL         = 25_000.0      # total ETF rotation allocation
-PER_POSITION    = 12_500.0      # per holding ($25k / 2)
+CAPITAL         = 13_333.0      # 6.7% of $200k portfolio (60% to Swing)
+PER_POSITION    =  6_667.0      # per holding (CAPITAL / TOP_N)
 TOP_N           = 2             # number of ETF positions
 MOMENTUM_DAYS   = 20            # lookback for momentum ranking
 
@@ -436,13 +436,14 @@ def print_combined_exposure(equity: float) -> None:
     logger.info("=" * 60)
     logger.info("COMBINED CAPITAL EXPOSURE (all bots)")
     logger.info("-" * 60)
-    logger.info(f"  ORB strategy      $75,000")
-    logger.info(f"  Overnight mom.    $50,000")
-    logger.info(f"  ETF Rotation      $25,000")
-    logger.info(f"  ─────────────────────────")
-    logger.info(f"  Total allocated  $150,000")
+    logger.info(f"  Swing Mom-14    $120,000  (60%)")
+    logger.info(f"  ORB strategy     $40,000  (20%)")
+    logger.info(f"  Overnight mom.   $26,667  (13.3%)")
+    logger.info(f"  ETF Rotation     $13,333  (6.7%)")
+    logger.info(f"  ──────────────────────────────────")
+    logger.info(f"  Total allocated $200,000")
     logger.info(f"  Account equity   ${equity:>10,.2f}")
-    logger.info(f"  Free buffer      ${equity - 150_000:>+10,.2f}")
+    logger.info(f"  Free buffer      ${equity - 200_000:>+10,.2f}")
     logger.info("=" * 60)
 
 

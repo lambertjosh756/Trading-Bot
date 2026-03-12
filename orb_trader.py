@@ -36,7 +36,6 @@ from alpaca.trading.requests import (
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.live import StockDataStream
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
 
@@ -48,9 +47,7 @@ ET = pytz.timezone("America/New_York")
 BASE_URL         = "https://paper-api.alpaca.markets"
 DATA_URL         = "https://data.alpaca.markets"
 MAX_POSITIONS    = 8
-TARGET_CAPITAL   = 75_000.0    # Reduced from 100k — overnight bot holds
-                                # up to $50k until 09:35, this keeps
-                                # combined exposure under $125k cash balance
+TARGET_CAPITAL   = 40_000.0    # 20% of $200k portfolio (60% to Swing)
 VOL_MULTIPLIER   = 1.5       # volume filter threshold
 RSI_LOW          = 40.0
 RSI_HIGH         = 60.0
@@ -112,6 +109,12 @@ class ORBTrader:
         # Active trades
         self.active_symbols:  Dict[str, dict]      = {}   # symbol -> trade info
         self.orders_placed:   set                  = set()
+        self._bar_count:      int                  = 0
+        self._logged_first:   set                  = set()
+        self._exit_flag:      bool                 = False
+        self._exit_event:     asyncio.Event        = asyncio.Event()
+        self._time_exit_done: bool                 = False
+        self._seen_bar_times: Dict[str, object]    = {}
 
         # Daily stats
         self.stats = {
@@ -161,6 +164,47 @@ class ORBTrader:
         for sym in self.watchlist:
             self.orb_recorded[sym] = False
 
+    # ── Late-start ORB backfill ───────────────────────────────────────────────
+
+    def backfill_orb(self) -> None:
+        """If started after 9:35 ET, fetch today's 9:30–9:35 bars and set ORB."""
+        if not self.watchlist:
+            return
+        now_et = datetime.now(ET)
+        orb_end = now_et.replace(hour=9, minute=35, second=0, microsecond=0)
+        if now_et <= orb_end:
+            return  # still in or before ORB window, let live stream handle it
+
+        today = now_et.date()
+        start = ET.localize(datetime(today.year, today.month, today.day, 9, 30))
+        end   = ET.localize(datetime(today.year, today.month, today.day, 9, 36))
+        logger.info("LATE START: Backfilling ORB from historical data…")
+        try:
+            req = StockBarsRequest(
+                symbol_or_symbols=self.watchlist,
+                timeframe=TimeFrame.Minute,
+                start=start.isoformat(),
+                end=end.isoformat(),
+                feed="iex",
+            )
+            bars = self.data_client.get_stock_bars(req)
+            found = 0
+            for sym in self.watchlist:
+                try:
+                    sym_bars = bars[sym]
+                    if sym_bars:
+                        highs = [b.high for b in sym_bars]
+                        lows  = [b.low  for b in sym_bars]
+                        self.orb_high[sym]     = max(highs)
+                        self.orb_low[sym]      = min(lows)
+                        self.orb_recorded[sym] = True
+                        found += 1
+                except Exception:
+                    pass
+            logger.info(f"LATE START: ORB backfilled for {found}/{len(self.watchlist)} symbols.")
+        except Exception as exc:
+            logger.warning(f"LATE START: Could not backfill ORB — {exc}")
+
     # ── Pre-load historical bars for RSI/volume baseline ─────────────────────
 
     def load_historical_bars(self):
@@ -177,6 +221,7 @@ class ORBTrader:
                 timeframe=TimeFrame.Minute,
                 start=start,
                 end=end,
+                feed="iex",
             )
             bars = self.data_client.get_stock_bars(req)
             for sym in self.watchlist:
@@ -229,6 +274,7 @@ class ORBTrader:
     def check_signal(self, symbol: str, bar) -> bool:
         """Return True if all entry conditions are met."""
         if not self.orb_recorded.get(symbol, False):
+            logger.debug(f"SIGNAL SKIP {symbol}: ORB not recorded")
             return False
         if symbol in self.active_symbols or symbol in self.orders_placed:
             return False
@@ -246,9 +292,11 @@ class ORBTrader:
         # Volume filter
         vols = list(self.bar_volumes[symbol])
         if len(vols) < 5:
+            logger.info(f"SIGNAL SKIP {symbol}: not enough volume history ({len(vols)} bars)")
             return False
         avg_vol = sum(vols[-VOL_AVG_PERIOD:]) / min(len(vols), VOL_AVG_PERIOD)
         if avg_vol == 0 or volume < VOL_MULTIPLIER * avg_vol:
+            logger.info(f"SIGNAL SKIP {symbol}: low volume ({volume:.0f} vs {VOL_MULTIPLIER}x avg {avg_vol:.0f})")
             return False
         vol_mult = volume / avg_vol
 
@@ -257,6 +305,7 @@ class ORBTrader:
         closes.append(close)
         rsi = calc_rsi(closes)
         if not (RSI_LOW <= rsi <= RSI_HIGH):
+            logger.info(f"SIGNAL SKIP {symbol}: RSI {rsi:.1f} out of range [{RSI_LOW},{RSI_HIGH}]")
             return False
 
         log_signal(logger, symbol, close, orb_h, vol_mult, rsi)
@@ -319,6 +368,15 @@ class ORBTrader:
         self.bar_closes[symbol].append(bar.close)
         self.bar_volumes[symbol].append(bar.volume)
 
+        # Diagnostic: log first bar per symbol + periodic total count
+        if symbol not in self._logged_first:
+            orb_h = self.orb_high.get(symbol, "N/A")
+            logger.info(f"STREAM: First bar — {symbol} close=${bar.close:.2f} ORB_high={orb_h}")
+            self._logged_first.add(symbol)
+        self._bar_count += 1
+        if self._bar_count % 50 == 0:
+            logger.info(f"STREAM: {self._bar_count} bars received total, {len(self.active_symbols)} active positions.")
+
         # Record ORB if in window
         self.record_orb_bar(symbol, bar)
 
@@ -339,6 +397,9 @@ class ORBTrader:
 
     def time_exit(self) -> None:
         """13:30 ET — cancel all open orders and close all positions."""
+        if self._time_exit_done:
+            return
+        self._time_exit_done = True
         logger.info("TIME EXIT: 13:30 ET reached — closing all positions…")
 
         # Cancel open orders
@@ -427,12 +488,57 @@ class ORBTrader:
             logger.info(f"SCHEDULER: Waiting {wait_secs:.0f}s until {hour:02d}:{minute:02d} ET…")
             await asyncio.sleep(min(wait_secs, 60))
 
-    async def wait_for_time_exit(self, stream: StockDataStream) -> None:
-        """Background task: sleep until 13:30 ET, then trigger time exit."""
+    async def wait_for_time_exit(self) -> None:
+        """Background task: sleep until 13:30 ET, then signal poll loop to stop."""
         await self.wait_until(13, 30)
-        logger.info("TIME EXIT: 13:30 ET — stopping stream and closing positions.")
-        self.time_exit()
-        await stream.stop_ws()
+        logger.info("TIME EXIT: 13:30 ET reached — signalling exit.")
+        self._exit_flag = True
+        self._exit_event.set()
+
+    # ── Polling loop (replaces websocket stream for IEX free tier) ───────────
+
+    async def poll_bars(self) -> None:
+        """Poll historical API every 30s for the latest 1-min bar per symbol."""
+        logger.info("POLL: Starting 30-second bar polling loop (IEX feed).")
+        while not self._exit_flag:
+            try:
+                await asyncio.wait_for(self._exit_event.wait(), timeout=30)
+                break  # exit event fired
+            except asyncio.TimeoutError:
+                pass   # normal poll interval
+            if self._exit_flag:
+                break
+            now_et = datetime.now(ET)
+            start  = (now_et - timedelta(minutes=5)).isoformat()
+            end    = now_et.isoformat()
+            try:
+                req = StockBarsRequest(
+                    symbol_or_symbols=self.watchlist,
+                    timeframe=TimeFrame.Minute,
+                    start=start,
+                    end=end,
+                    feed="iex",
+                )
+                bars = self.data_client.get_stock_bars(req)
+                fetched = 0
+                for sym in self.watchlist:
+                    try:
+                        sym_bars = bars[sym]
+                        if not sym_bars:
+                            continue
+                        latest = sym_bars[-1]
+                        # Skip bars we've already processed
+                        if self._seen_bar_times.get(sym) == latest.timestamp:
+                            continue
+                        self._seen_bar_times[sym] = latest.timestamp
+                        await self.on_bar(latest)
+                        fetched += 1
+                    except Exception:
+                        pass
+                if fetched:
+                    logger.info(f"POLL: Fetched {fetched} new bars at {now_et.strftime('%H:%M:%S ET')}")
+            except Exception as exc:
+                logger.warning(f"POLL: Bar fetch failed — {exc}")
 
     # ── Main run loop ─────────────────────────────────────────────────────────
 
@@ -451,26 +557,21 @@ class ORBTrader:
         # Pre-load historical bars
         self.load_historical_bars()
 
+        # Backfill ORB from history if started after 9:35 ET
+        self.backfill_orb()
+
         # ── 9:30 ET — wait for market open ──────────────────────────────────
         if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30):
             await self.wait_until(9, 30)
-        logger.info("MARKET OPEN: Starting ORB recording and live stream.")
+        logger.info("MARKET OPEN: Starting ORB recording and bar polling.")
 
-        # ── Stream live 1-min bars ───────────────────────────────────────────
-        stream = StockDataStream(
-            api_key=self.api_key,
-            secret_key=self.api_secret,
-        )
-        stream.subscribe_bars(self.on_bar, *self.watchlist)
-
-        # Run time-exit watcher concurrently
-        asyncio.create_task(self.wait_for_time_exit(stream))
+        # ── Poll bars + time-exit watcher ────────────────────────────────────
+        asyncio.create_task(self.wait_for_time_exit())
 
         try:
-            await stream._run_forever()
-        except Exception as exc:
-            logger.error(f"STREAM ERROR: {exc}")
+            await self.poll_bars()
         finally:
+            self.time_exit()
             self.write_daily_summary()
 
 

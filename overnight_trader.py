@@ -44,8 +44,8 @@ from momentum_universe import (
 ET               = pytz.timezone("America/New_York")
 ENV_FILE         = ".env"
 STATE_FILE       = ".overnight_state.json"
-CAPITAL          = 50_000.0      # total overnight allocation
-POSITION_CAPITAL = 10_000.0      # per-position allocation
+CAPITAL          = 26_667.0      # 13.3% of $200k portfolio (60% to Swing)
+POSITION_CAPITAL =  5_333.0      # per-position allocation (CAPITAL / TOP_N)
 TOP_N            = 5             # max positions
 
 logger = get_logger("overnight_trader", log_prefix="overnight")

@@ -54,8 +54,8 @@ ET              = pytz.timezone("America/New_York")
 ENV_FILE        = ".env"
 STATE_FILE      = ".swing_state.json"
 
-CAPITAL         = 75_000.0
-POS_SIZE        = 5_000.0
+CAPITAL         = 120_000.0
+POS_SIZE        =   8_000.0
 MAX_POSITIONS   = 15
 HOLD_DAYS       = 14        # calendar days
 STOP_PCT        = 0.05      # -5% hard stop

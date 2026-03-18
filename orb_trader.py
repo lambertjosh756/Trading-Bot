@@ -47,7 +47,7 @@ ET = pytz.timezone("America/New_York")
 BASE_URL         = "https://paper-api.alpaca.markets"
 DATA_URL         = "https://data.alpaca.markets"
 MAX_POSITIONS    = 8
-TARGET_CAPITAL   = 40_000.0    # 20% of $200k portfolio (60% to Swing)
+TARGET_CAPITAL   = 75_000.0    # 75% of $100k portfolio (shared window with Swing)
 VOL_MULTIPLIER   = 1.5       # volume filter threshold
 RSI_LOW          = 40.0
 RSI_HIGH         = 60.0
@@ -66,11 +66,15 @@ def calc_rsi(closes: list[float], period: int = 14) -> float:
     """Wilder RSI from a list of close prices (most recent last)."""
     if len(closes) < period + 1:
         return 50.0   # neutral default when insufficient data
-    deltas = np.diff(closes[-period - 1:])
+    deltas = np.diff(closes)
     gains  = np.where(deltas > 0, deltas, 0.0)
     losses = np.where(deltas < 0, -deltas, 0.0)
-    avg_gain = gains.mean()
-    avg_loss = losses.mean()
+    # Wilder's smoothed moving average: seed with SMA, then smooth remainder
+    avg_gain = gains[:period].mean()
+    avg_loss = losses[:period].mean()
+    for g, l in zip(gains[period:], losses[period:]):
+        avg_gain = (avg_gain * (period - 1) + g) / period
+        avg_loss = (avg_loss * (period - 1) + l) / period
     if avg_loss == 0:
         return 100.0
     rs = avg_gain / avg_loss
@@ -300,9 +304,8 @@ class ORBTrader:
             return False
         vol_mult = volume / avg_vol
 
-        # RSI filter
+        # RSI filter (bar.close already appended to bar_closes in on_bar)
         closes = list(self.bar_closes[symbol])
-        closes.append(close)
         rsi = calc_rsi(closes)
         if not (RSI_LOW <= rsi <= RSI_HIGH):
             logger.info(f"SIGNAL SKIP {symbol}: RSI {rsi:.1f} out of range [{RSI_LOW},{RSI_HIGH}]")
@@ -328,6 +331,8 @@ class ORBTrader:
 
             target_price = round(entry_price * (1 + PROFIT_PCT), 2)
             stop_price   = round(entry_price * (1 - STOP_PCT),   2)
+            # Alpaca requires stop >= $0.01 below entry — enforce minimum gap
+            stop_price   = min(stop_price, round(entry_price - 0.01, 2))
 
             # Market buy
             buy_req = MarketOrderRequest(
@@ -396,25 +401,42 @@ class ORBTrader:
     # ── Time exit ─────────────────────────────────────────────────────────────
 
     def time_exit(self) -> None:
-        """13:30 ET — cancel all open orders and close all positions."""
+        """13:30 ET — cancel this bot's open orders and close only ORB positions."""
         if self._time_exit_done:
             return
         self._time_exit_done = True
-        logger.info("TIME EXIT: 13:30 ET reached — closing all positions…")
 
-        # Cancel open orders
+        # Only act on positions this bot opened — never touch other bots' positions
+        orb_symbols = set(self.active_symbols.keys())
+        if not orb_symbols:
+            logger.info("TIME EXIT: No active ORB positions to close — skipping.")
+            return
+
+        logger.info(f"TIME EXIT: 13:30 ET — closing {len(orb_symbols)} ORB position(s): {', '.join(orb_symbols)}")
+
+        # Cancel open orders for our symbols only
         try:
-            self.trading_client.cancel_orders()
-            logger.info("TIME EXIT: All open orders cancelled.")
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            req = GetOrdersRequest(status=QueryOrderStatus.OPEN)
+            open_orders = self.trading_client.get_orders(req)
+            for order in open_orders:
+                if order.symbol in orb_symbols:
+                    try:
+                        self.trading_client.cancel_order_by_id(order.id)
+                    except Exception:
+                        pass
+            logger.info("TIME EXIT: ORB open orders cancelled.")
         except Exception as exc:
             logger.error(f"TIME EXIT: Failed to cancel orders — {exc}")
 
-        # Close all positions
+        # Close only ORB positions
         try:
             positions = self.trading_client.get_all_positions()
             for pos in positions:
                 sym = pos.symbol
-                qty = abs(int(float(pos.qty)))
+                if sym not in orb_symbols:
+                    continue
                 try:
                     self.trading_client.close_position(sym)
                     current_price = float(pos.current_price)
@@ -427,6 +449,40 @@ class ORBTrader:
                     logger.error(f"TIME EXIT: Failed to close {sym} — {exc}")
         except Exception as exc:
             logger.error(f"TIME EXIT: Could not fetch positions — {exc}")
+
+    # ── Poll bracket exits ────────────────────────────────────────────────────
+
+    def _check_bracket_exits(self) -> None:
+        """Detect bracket orders (TP/SL) that Alpaca closed while we weren't looking."""
+        if not self.active_symbols:
+            return
+        try:
+            from alpaca.trading.requests import GetOrdersRequest
+            from alpaca.trading.enums import QueryOrderStatus
+            req = GetOrdersRequest(status=QueryOrderStatus.CLOSED, limit=50)
+            closed_orders = self.trading_client.get_orders(req)
+            open_syms = set(self.active_symbols.keys())
+            for order in closed_orders:
+                sym = order.symbol
+                if sym not in open_syms:
+                    continue
+                side = str(order.side)
+                if "sell" not in side.lower():
+                    continue
+                filled_price = float(order.filled_avg_price or 0)
+                if filled_price == 0:
+                    continue
+                trade = self.active_symbols[sym]
+                entry  = trade["entry"]
+                qty    = trade["qty"]
+                pnl    = (filled_price - entry) * qty
+                pnl_pct = (filled_price - entry) / entry * 100
+                exit_type = "TP" if filled_price >= trade["target"] * 0.999 else "SL/BRACKET"
+                log_exit(logger, sym, exit_type, filled_price, pnl, pnl_pct)
+                self._record_trade_result(sym, pnl)
+                open_syms.discard(sym)
+        except Exception as exc:
+            logger.debug(f"BRACKET CHECK: {exc}")
 
     # ── Track P&L ─────────────────────────────────────────────────────────────
 
@@ -537,42 +593,73 @@ class ORBTrader:
                         pass
                 if fetched:
                     logger.info(f"POLL: Fetched {fetched} new bars at {now_et.strftime('%H:%M:%S ET')}")
+                # Detect any bracket exits (TP/SL) Alpaca closed between polls
+                self._check_bracket_exits()
             except Exception as exc:
                 logger.warning(f"POLL: Bar fetch failed — {exc}")
 
     # ── Main run loop ─────────────────────────────────────────────────────────
 
     async def run(self) -> None:
-        # Validate account
         self.validate_account()
 
-        now_et = datetime.now(ET)
-        logger.info(f"BOT START: Current time {now_et.strftime('%H:%M:%S ET')}")
+        while True:
+            now_et  = datetime.now(ET)
+            weekday = now_et.weekday()  # 0=Mon … 4=Fri
 
-        # ── 9:15 ET — fetch watchlist ────────────────────────────────────────
-        if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 15):
-            await self.wait_until(9, 15)
-        await self.run_watchlist_fetch()
+            # Skip weekends
+            if weekday >= 5:
+                await asyncio.sleep(3600)
+                continue
 
-        # Pre-load historical bars
-        self.load_historical_bars()
+            # If started after 13:30 ET, sleep until next trading day 09:15 ET
+            cutoff = now_et.replace(hour=13, minute=30, second=0, microsecond=0)
+            if now_et >= cutoff:
+                # Sleep until tomorrow (or Monday if Friday) 09:15 ET
+                days_ahead = 3 if weekday == 4 else 1
+                next_start = (now_et + timedelta(days=days_ahead)).replace(
+                    hour=9, minute=15, second=0, microsecond=0
+                )
+                wait_secs = (next_start - now_et).total_seconds()
+                logger.info(f"SCHEDULER: Past 13:30 ET — sleeping {wait_secs/3600:.1f}h until next session 09:15 ET.")
+                await asyncio.sleep(wait_secs)
+                # Reset state for new day
+                self.orb_high.clear(); self.orb_low.clear(); self.orb_recorded.clear()
+                self.orb_candles.clear(); self.active_symbols.clear(); self.orders_placed.clear()
+                self._bar_count = 0; self._logged_first.clear()
+                self._exit_flag = False; self._exit_event.clear(); self._time_exit_done = False
+                self._seen_bar_times.clear()
+                self.stats = {"signals":0,"trades":0,"wins":0,"losses":0,"net_pnl":0.0,
+                              "best_trade":None,"worst_trade":None,"start_equity":0.0,"end_equity":0.0}
+                self.validate_account()
+                continue
 
-        # Backfill ORB from history if started after 9:35 ET
-        self.backfill_orb()
+            logger.info(f"BOT START: Current time {now_et.strftime('%H:%M:%S ET')}")
 
-        # ── 9:30 ET — wait for market open ──────────────────────────────────
-        if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30):
-            await self.wait_until(9, 30)
-        logger.info("MARKET OPEN: Starting ORB recording and bar polling.")
+            # ── 9:15 ET — fetch watchlist ──────────────────────────────────
+            if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 15):
+                await self.wait_until(9, 15)
+            await self.run_watchlist_fetch()
 
-        # ── Poll bars + time-exit watcher ────────────────────────────────────
-        asyncio.create_task(self.wait_for_time_exit())
+            self.load_historical_bars()
+            self.backfill_orb()
 
-        try:
-            await self.poll_bars()
-        finally:
-            self.time_exit()
-            self.write_daily_summary()
+            # ── 9:30 ET — wait for market open ────────────────────────────
+            if now_et.hour < 9 or (now_et.hour == 9 and now_et.minute < 30):
+                await self.wait_until(9, 30)
+            logger.info("MARKET OPEN: Starting ORB recording and bar polling.")
+
+            self._exit_flag = False
+            self._exit_event.clear()
+            self._time_exit_done = False
+
+            asyncio.create_task(self.wait_for_time_exit())
+
+            try:
+                await self.poll_bars()
+            finally:
+                self.time_exit()
+                self.write_daily_summary()
 
 
 # ── Key management ────────────────────────────────────────────────────────────

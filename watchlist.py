@@ -31,7 +31,7 @@ UNIVERSE: List[str] = [
     "NFLX", "BABA", "CRM", "PYPL", "INTC", "QCOM", "MU",
     "SPY",  "QQQ",  "IWM",  "ARKK",
     "BAC",  "JPM",  "GS",   "MS",
-    "XOM",  "CVX",  "SLB",
+    "XOM",  "CVX",  "SLB",  "EOG",
     "PFE",  "MRNA", "JNJ",
     "PLTR", "SOFI", "HOOD", "COIN", "MSTR",
     "F",    "GM",   "NIO",  "RIVN", "LCID",
@@ -93,6 +93,7 @@ def build_watchlist(api_key: str, api_secret: str) -> List[str]:
             timeframe=TimeFrame.Day,
             start=start_date,
             end=today_str,
+            feed="iex",
         )
         daily_bars = client.get_stock_bars(bars_req)
     except Exception as exc:
@@ -140,6 +141,7 @@ def build_watchlist(api_key: str, api_secret: str) -> List[str]:
             timeframe=TimeFrame.Minute,
             start=premarket_start.isoformat(),
             end=premarket_end.isoformat(),
+            feed="iex",
         )
         pm_bars = client.get_stock_bars(pm_req)
     except Exception as exc:

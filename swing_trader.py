@@ -32,6 +32,8 @@ import sys
 from datetime import date, datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
+import numpy as np
+
 import pytz
 from dotenv import load_dotenv
 
@@ -54,8 +56,8 @@ ET              = pytz.timezone("America/New_York")
 ENV_FILE        = ".env"
 STATE_FILE      = ".swing_state.json"
 
-CAPITAL         = 120_000.0
-POS_SIZE        =   8_000.0
+CAPITAL         =  75_000.0    # 75% of $100k portfolio (shared window with ORB: safe, non-overlapping)
+POS_SIZE        =   5_000.0    # per position ($75k / 15 slots)
 MAX_POSITIONS   = 15
 HOLD_DAYS       = 14        # calendar days
 STOP_PCT        = 0.05      # -5% hard stop
@@ -63,6 +65,13 @@ SCAN_HOUR       = 15
 SCAN_MIN        = 45
 
 logger = get_logger("swing_trader", log_prefix="swing")
+
+
+# -- Helpers -------------------------------------------------------------------
+
+def trading_days_since(entry_date: date) -> int:
+    """Count trading days (Mon–Fri) elapsed since entry_date (exclusive)."""
+    return int(np.busday_count(entry_date, date.today()))
 
 
 # -- State management ----------------------------------------------------------
@@ -164,7 +173,7 @@ class SwingTrader:
 
         for sym, pos in positions.items():
             entry_date = date.fromisoformat(pos["entry_date"])
-            days_held  = (today - entry_date).days
+            days_held  = trading_days_since(entry_date)
             stop_price = pos["entry_price"] * (1 - STOP_PCT)
 
             # Get current price (Alpaca position if available, else latest bar)
@@ -292,7 +301,8 @@ class SwingTrader:
             self.trading_client.submit_order(req)
 
             entry_date = date.today().isoformat()
-            exit_date  = (date.today() + timedelta(days=HOLD_DAYS)).strftime("%b %d")
+            # HOLD_DAYS is in trading days; approximate calendar display
+            exit_date  = str(np.busday_offset(date.today(), HOLD_DAYS, roll="forward"))
 
             logger.info(
                 f"ENTRY: {c.symbol} ${POS_SIZE:,.0f} @ ${live_price:.2f} | "
@@ -352,7 +362,7 @@ class SwingTrader:
             curr     = ap["current"] if ap else pos["entry_price"]
             pnl      = (curr - pos["entry_price"]) * pos["shares"]
             pnl_pct  = (curr - pos["entry_price"]) / pos["entry_price"] * 100
-            days_held = (date.today() - date.fromisoformat(pos["entry_date"])).days
+            days_held = trading_days_since(date.fromisoformat(pos["entry_date"]))
             sign     = "+" if pnl >= 0 else ""
             pos_lines += (
                 f"    {sym:<6}  entry ${pos['entry_price']:.2f}  "
@@ -470,6 +480,7 @@ class SwingTrader:
 
         # -- 3. Persist state and print summary -----------------------------
         if not dry_run:
+            state["last_scan_date"] = date.today().isoformat()
             save_state(state)
         self.eod_summary(state, exits_today, entries_today, daily_pnl)
 
@@ -516,6 +527,13 @@ class SwingTrader:
                 continue
 
             await self.wait_until(SCAN_HOUR, SCAN_MIN)
+
+            # Skip scan if it already ran today (bot restarted after 15:45)
+            if state.get("last_scan_date") == date.today().isoformat():
+                logger.info("SCHEDULER: Scan already ran today — skipping to tomorrow.")
+                await self.sleep_until_tomorrow(SCAN_HOUR, SCAN_MIN)
+                continue
+
             await self.run_scan(state)
             await self.sleep_until_tomorrow(SCAN_HOUR, SCAN_MIN)
 
@@ -537,7 +555,7 @@ def show_status(trader: SwingTrader, state: dict) -> None:
             curr      = ap["current"] if ap else pos["entry_price"]
             pnl       = (curr - pos["entry_price"]) * pos["shares"]
             pnl_pct   = (curr - pos["entry_price"]) / pos["entry_price"] * 100
-            days_held = (date.today() - date.fromisoformat(pos["entry_date"])).days
+            days_held = trading_days_since(date.fromisoformat(pos["entry_date"]))
             exit_date = (date.fromisoformat(pos["entry_date"]) + timedelta(days=HOLD_DAYS)).isoformat()
             stop_px   = pos["entry_price"] * (1 - STOP_PCT)
             sign      = "+" if pnl >= 0 else ""

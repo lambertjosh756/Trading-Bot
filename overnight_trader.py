@@ -30,8 +30,8 @@ import pytz
 from dotenv import load_dotenv
 
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.requests import MarketOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, QueryOrderStatus
 
 from logger import get_logger
 from momentum_universe import (
@@ -44,8 +44,8 @@ from momentum_universe import (
 ET               = pytz.timezone("America/New_York")
 ENV_FILE         = ".env"
 STATE_FILE       = ".overnight_state.json"
-CAPITAL          = 26_667.0      # 13.3% of $200k portfolio (60% to Swing)
-POSITION_CAPITAL =  5_333.0      # per-position allocation (CAPITAL / TOP_N)
+CAPITAL          = 50_000.0      # 50% of $100k portfolio
+POSITION_CAPITAL = 10_000.0      # per-position allocation (CAPITAL / TOP_N)
 TOP_N            = 5             # max positions
 
 logger = get_logger("overnight_trader", log_prefix="overnight")
@@ -140,11 +140,29 @@ class OvernightTrader:
 
     # ── Exit positions ─────────────────────────────────────────────────────────
 
-    def sell_positions(self, symbols: List[str]) -> Dict[str, float]:
+    def _cancel_open_orders(self, sym: str) -> None:
+        """Cancel all open orders for a given symbol."""
+        try:
+            req = GetOrdersRequest(symbols=[sym], status=QueryOrderStatus.OPEN)
+            orders = self.trading_client.get_orders(req)
+            for order in orders:
+                try:
+                    self.trading_client.cancel_order_by_id(order.id)
+                    logger.info(f"CANCEL: {sym} order {order.id} cancelled")
+                except Exception as exc:
+                    logger.warning(f"CANCEL: Could not cancel {sym} order {order.id} — {exc}")
+        except Exception as exc:
+            logger.warning(f"CANCEL: Could not fetch open orders for {sym} — {exc}")
+
+    async def sell_positions(self, symbols: List[str]) -> Dict[str, float]:
         """
-        Market-sell each symbol in `symbols`.
-        Returns {symbol: pnl} from position data before selling.
+        Market-sell each symbol in `symbols`, retrying until confirmed closed.
+        On each retry: cancel any pending orders then resubmit close_position.
+        Returns {symbol: pnl} from position data at first close attempt.
         """
+        MAX_RETRIES  = 10
+        RETRY_DELAY  = 5   # seconds between confirmation checks
+
         if not symbols:
             logger.info("EXIT: No overnight positions to close.")
             return {}
@@ -156,36 +174,59 @@ class OvernightTrader:
         for sym in symbols:
             pos = open_pos.get(sym)
             if pos is None:
-                logger.warning(f"EXIT: {sym} — no open position found, skipping.")
+                logger.warning(f"EXIT: {sym} — no open position found, already closed.")
+                pnl_map[sym] = 0.0   # treat as closed so it's removed from state
                 continue
-            try:
-                self.trading_client.close_position(sym)
-                pnl     = pos["pnl"]
-                pnl_pct = (pos["current"] - pos["entry_price"]) / pos["entry_price"] * 100
-                sign    = "+" if pnl >= 0 else ""
-                logger.info(
-                    f"SELL: {sym} {pos['qty']} shares @ ${pos['current']:.2f} | "
-                    f"Entry: ${pos['entry_price']:.2f} | "
-                    f"P&L: {sign}${pnl:.2f} ({sign}{pnl_pct:.1f}%)"
-                )
-                pnl_map[sym] = pnl
-                self.stats["net_pnl"] += pnl
-                if pnl > 0:
-                    self.stats["wins"] += 1
+
+            pnl     = pos["pnl"]
+            pnl_pct = (pos["current"] - pos["entry_price"]) / pos["entry_price"] * 100
+
+            for attempt in range(1, MAX_RETRIES + 1):
+                # Cancel any stale orders before submitting (on retries)
+                if attempt > 1:
+                    logger.info(f"EXIT: {sym} — cancelling open orders before retry {attempt}…")
+                    self._cancel_open_orders(sym)
+                    await asyncio.sleep(1)
+
+                try:
+                    self.trading_client.close_position(sym)
+                    logger.info(f"EXIT: {sym} close order submitted (attempt {attempt})")
+                except Exception as exc:
+                    logger.warning(f"EXIT: {sym} close_position error (attempt {attempt}) — {exc}")
+
+                # Wait then confirm the position is gone
+                await asyncio.sleep(RETRY_DELAY)
+                current_positions = self.get_open_positions()
+                if sym not in current_positions:
+                    sign = "+" if pnl >= 0 else ""
+                    logger.info(
+                        f"SELL: {sym} {pos['qty']} shares @ ${pos['current']:.2f} | "
+                        f"Entry: ${pos['entry_price']:.2f} | "
+                        f"P&L: {sign}${pnl:.2f} ({sign}{pnl_pct:.1f}%)"
+                    )
+                    pnl_map[sym] = pnl
+                    self.stats["net_pnl"] += pnl
+                    if pnl > 0:
+                        self.stats["wins"] += 1
+                    else:
+                        self.stats["losses"] += 1
+                    break
                 else:
-                    self.stats["losses"] += 1
-            except Exception as exc:
-                logger.error(f"EXIT: Failed to close {sym} — {exc}")
+                    logger.warning(
+                        f"EXIT: {sym} still open after attempt {attempt}/{MAX_RETRIES} — retrying…"
+                    )
+            else:
+                logger.error(f"EXIT: {sym} could NOT be closed after {MAX_RETRIES} attempts!")
 
         return pnl_map
 
-    def close_all_overnight_positions(self, state: dict) -> None:
+    async def close_all_overnight_positions(self, state: dict) -> None:
         """Safety cleanup: close any position in the state file."""
         symbols = state.get("symbols", [])
         if not symbols:
             return
         logger.info(f"CLEANUP: Closing overnight positions: {', '.join(symbols)}")
-        self.sell_positions(symbols)
+        await self.sell_positions(symbols)
 
     # ── Entry positions ────────────────────────────────────────────────────────
 
@@ -291,29 +332,62 @@ class OvernightTrader:
     # ── Morning exit ──────────────────────────────────────────────────────────
 
     async def morning_exit(self, state: dict) -> None:
-        """09:35 ET — sell all overnight positions from prior day."""
-        symbols = state.get("symbols", [])
+        """09:35 ET — sell all overnight positions from prior day.
+
+        Merges symbols from the state file with any currently open account
+        positions so that a stale/missing state file doesn't leave positions
+        stranded.
+        """
+        state_symbols: List[str] = state.get("symbols", [])
+
+        # Also pull live positions so we don't miss anything held overnight
+        live_positions = self.get_open_positions()
+        live_symbols   = list(live_positions.keys())
+
+        # Union of state-file symbols and live account positions
+        symbols = list(dict.fromkeys(state_symbols + live_symbols))  # preserves order, deduplicates
+
         if not symbols:
+            logger.info("MORNING EXIT: No open positions found (state file + live account).")
             return
 
-        now_et = datetime.now(ET)
+        extra = [s for s in live_symbols if s not in state_symbols]
+        if extra:
+            logger.warning(
+                f"MORNING EXIT: Found {len(extra)} live position(s) not in state file "
+                f"— will close: {', '.join(extra)}"
+            )
+
+        now_et    = datetime.now(ET)
         exit_time = now_et.replace(hour=9, minute=35, second=0, microsecond=0)
 
+        # If positions were entered today (afternoon), exit_time is tomorrow's 9:35
+        state_date = state.get("date")
+        entered_today = (state_date == date.today().isoformat())
+        if entered_today and now_et >= exit_time:
+            exit_time += timedelta(days=1)
+
         if now_et < exit_time:
+            wait_hrs = (exit_time - now_et).total_seconds() / 3600
             logger.info(
                 f"MORNING: Found {len(symbols)} overnight positions. "
-                f"Waiting for 09:35 ET to exit."
+                f"Waiting {wait_hrs:.1f}h for 09:35 ET to exit."
             )
-            await self.wait_until(9, 35)
+            while datetime.now(ET) < exit_time:
+                await asyncio.sleep(60)
 
         logger.info(f"MORNING EXIT: 09:35 ET — closing {len(symbols)} positions: {', '.join(symbols)}")
-        pnl_map = self.sell_positions(symbols)
+        pnl_map = await self.sell_positions(symbols)
 
         total_pnl = sum(pnl_map.values())
         sign      = "+" if total_pnl >= 0 else ""
         logger.info(f"MORNING SUMMARY: Net overnight P&L: {sign}${total_pnl:.2f} | Closed: {len(pnl_map)}/{len(symbols)}")
 
-        save_state([], {})
+        # Only clear symbols that were confirmed closed — keep any that failed to avoid orphans
+        closed = set(pnl_map.keys())
+        remaining = [s for s in symbols if s not in closed]
+        remaining_entries = {s: state.get("entries", {}).get(s, {}) for s in remaining}
+        save_state(remaining, remaining_entries)
         self.stats["days"] += 1
 
     # ── EOD summary ───────────────────────────────────────────────────────────
@@ -350,13 +424,20 @@ class OvernightTrader:
         logger.info(f"BOT START: {now_et.strftime('%H:%M:%S ET on %A %Y-%m-%d')}")
 
         # ── Step 1: Check for prior-day positions and exit at morning ─────────
-        state = load_state()
-        if state.get("symbols"):
+        state      = load_state()
+        live_pos   = self.get_open_positions()
+        state_syms = state.get("symbols", [])
+
+        if state_syms:
             logger.info(
                 f"STATE: Found positions from {state.get('date')}: "
-                f"{', '.join(state['symbols'])}"
+                f"{', '.join(state_syms)} — will exit at scheduled 09:35 ET."
             )
-            await self.morning_exit(state)
+        if live_pos:
+            logger.info(
+                f"LIVE POSITIONS: {len(live_pos)} open in account: "
+                f"{', '.join(live_pos.keys())} — held until scheduled exit."
+            )
 
         # ── Continuous daily loop ─────────────────────────────────────────────
         while True:
@@ -413,7 +494,7 @@ class OvernightTrader:
 
             # Safety: close any leftover overnight positions not yet cleared
             state = load_state()
-            self.close_all_overnight_positions(state)
+            await self.close_all_overnight_positions(state)
 
             entries = self.buy_positions(candidates)
             if entries:
@@ -432,11 +513,14 @@ class OvernightTrader:
 
             if symbols:
                 logger.info(f"MORNING EXIT: 09:35 ET — closing {len(symbols)} positions: {', '.join(symbols)}")
-                pnl_map   = self.sell_positions(symbols)
+                pnl_map   = await self.sell_positions(symbols)
                 total_pnl = sum(pnl_map.values())
                 sign      = "+" if total_pnl >= 0 else ""
                 logger.info(f"MORNING SUMMARY: Net overnight P&L: {sign}${total_pnl:.2f}")
-                save_state([], {})
+                closed = set(pnl_map.keys())
+                remaining = [s for s in symbols if s not in closed]
+                remaining_entries = {s: state.get("entries", {}).get(s, {}) for s in remaining}
+                save_state(remaining, remaining_entries)
                 self.stats["days"] += 1
 
 

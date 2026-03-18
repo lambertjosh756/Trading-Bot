@@ -1,0 +1,9 @@
+# Exclude everything by default
+*
+
+# Only include what the bot needs
+!crypto_trader.py
+!crypto_scalper.py
+!crypto_compare.py
+!requirements.txt
+!Dockerfile

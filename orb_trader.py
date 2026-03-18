@@ -385,17 +385,18 @@ class ORBTrader:
         # Record ORB if in window
         self.record_orb_bar(symbol, bar)
 
-        # Check time (force exit at 13:30)
+        # Check time gates
         bar_et = bar.timestamp.astimezone(ET) if bar.timestamp.tzinfo else \
                  pytz.utc.localize(bar.timestamp).astimezone(ET)
         now_et = datetime.now(ET)
-        force_exit_time = now_et.replace(hour=13, minute=30, second=0, microsecond=0)
+        force_exit_time  = now_et.replace(hour=13, minute=30, second=0, microsecond=0)
+        entry_cutoff     = now_et.replace(hour=12, minute=45, second=0, microsecond=0)
 
         if now_et >= force_exit_time:
             return   # handled by time_exit()
 
-        # Check entry signal
-        if self.check_signal(symbol, bar):
+        # Check entry signal — no new entries after 12:45 ET
+        if now_et < entry_cutoff and self.check_signal(symbol, bar):
             self.submit_bracket_order(symbol, bar.close)
 
     # ── Time exit ─────────────────────────────────────────────────────────────

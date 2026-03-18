@@ -554,11 +554,11 @@ class ORBTrader:
     # ── Polling loop (replaces websocket stream for IEX free tier) ───────────
 
     async def poll_bars(self) -> None:
-        """Poll historical API every 30s for the latest 1-min bar per symbol."""
-        logger.info("POLL: Starting 30-second bar polling loop (IEX feed).")
+        """Poll historical API every 15s for the latest 1-min bar per symbol."""
+        logger.info("POLL: Starting 15-second bar polling loop (IEX feed).")
         while not self._exit_flag:
             try:
-                await asyncio.wait_for(self._exit_event.wait(), timeout=30)
+                await asyncio.wait_for(self._exit_event.wait(), timeout=15)
                 break  # exit event fired
             except asyncio.TimeoutError:
                 pass   # normal poll interval
